@@ -1,0 +1,612 @@
+import hashlib
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+import injection_pipeline.handwriting.provider as provider_module
+from injection_pipeline.config import load_identifier_schema
+from injection_pipeline.config.identifier_schema import DEFAULT_IDENTIFIER_SCHEMA_PATH
+from injection_pipeline.handwriting import (
+    ALLOWED_HANDWRITING_FIELDS,
+    DockerHandwritingGenerator,
+    GeneratedHandwritingManifest,
+    HandwritingAlphabetError,
+    HandwritingAssetProvider,
+    HandwritingCacheIdentity,
+    HandwritingGenerationRequest,
+    HandwritingGenerationResult,
+    HandwritingGeneratorOptions,
+    HandwritingProviderError,
+    HandwritingRuntimeConfig,
+    HandwritingTextAssetRequest,
+    MissingHandwritingCheckpointError,
+)
+from injection_pipeline.models import Identity
+
+
+class FakeHandwritingGenerator:
+    def __init__(self) -> None:
+        self.calls: list[HandwritingGenerationRequest] = []
+
+    def generate(
+        self, request: HandwritingGenerationRequest
+    ) -> HandwritingGenerationResult:
+        self.calls.append(request)
+        run_dir = request.output_root / request.run_id
+        records = []
+        for asset in request.assets:
+            image_path = run_dir / "images" / f"{asset.asset_id}.png"
+            mask_path = run_dir / "masks" / f"{asset.asset_id}-mask.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            mask_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGBA", (2, 2), (0, 0, 0, 255)).save(image_path)
+            Image.new("L", (2, 2), 255).save(mask_path)
+            records.append(
+                {
+                    "asset_id": asset.asset_id,
+                    "field": asset.field,
+                    "text": asset.text,
+                    "image_path": image_path.relative_to(run_dir).as_posix(),
+                    "mask_path": mask_path.relative_to(run_dir).as_posix(),
+                    "image_sha256": _sha256_file(image_path),
+                    "mask_sha256": _sha256_file(mask_path),
+                    "checkpoint_sha256": request.checkpoint_sha256,
+                    "generator_options_sha256": request.options.options_sha256,
+                    "scrabblegan_repo_url": "local-test",
+                    "scrabblegan_commit": request.upstream_commit,
+                    "ink_color": request.options.ink_color,
+                    "background": request.options.background,
+                    "seed": asset.identity.seed,
+                    "ink_bbox": {"x": 0, "y": 0, "width": 2, "height": 2},
+                    "image_size": {"width": 2, "height": 2},
+                }
+            )
+        manifest_path = run_dir / "manifest.jsonl"
+        manifest_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return HandwritingGenerationResult(manifest_path=manifest_path)
+
+
+class FailingHandwritingGenerator:
+    def generate(
+        self, request: HandwritingGenerationRequest
+    ) -> HandwritingGenerationResult:
+        raise HandwritingProviderError("generator exploded")
+
+
+class MismatchedOptionsGenerator(FakeHandwritingGenerator):
+    def generate(
+        self, request: HandwritingGenerationRequest
+    ) -> HandwritingGenerationResult:
+        result = super().generate(request)
+        records = [
+            {
+                **json.loads(line),
+                "generator_options_sha256": "0" * 64,
+            }
+            for line in result.manifest_path.read_text(encoding="utf-8").splitlines()
+        ]
+        result.manifest_path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return result
+
+
+def test_cache_identity_key_includes_required_inputs() -> None:
+    base = _cache_identity(text="Doe^Jane")
+    changed_text = _cache_identity(text="Roe^Jane")
+    changed_schema = _cache_identity(text="Doe^Jane", schema_version="2.0.0")
+    changed_options = _cache_identity(
+        text="Doe^Jane",
+        generator_options={
+            "generator_name": "scrabblegan",
+            "ink_color": "gray",
+            "background": "transparent",
+            "alphabet": "abc",
+            "options_sha256": _options_sha(),
+            "word_gap_px": 12,
+            "cpu_only": True,
+            "extra": {"options_sidecar_name": "test_opt.txt"},
+        },
+    )
+
+    assert base.cache_key == _cache_identity(text="Doe^Jane").cache_key
+    assert len(base.cache_key) == 64
+    assert changed_text.cache_key != base.cache_key
+    assert changed_schema.cache_key != base.cache_key
+    assert changed_options.cache_key != base.cache_key
+
+
+def test_cache_identity_ignores_legacy_presentation_color_and_background(
+    tmp_path: Path,
+) -> None:
+    schema = load_identifier_schema(DEFAULT_IDENTIFIER_SCHEMA_PATH)
+    identity = Identity(
+        identity_id="test-id",
+        seed=42,
+        fields={
+            "patient_name": "Doe^Jane",
+            "patient_id": "SYNTH-123456",
+            "accession_number": "ACC-7654321",
+        },
+    )
+    runtime = _runtime(tmp_path)
+    black = _options()
+    gray_on_white = black.model_copy(
+        update={"ink_color": "gray", "background": "white"}
+    )
+
+    black_assets = provider_module._build_requested_assets(
+        identity,
+        schema,
+        runtime,
+        black,
+    )
+    gray_assets = provider_module._build_requested_assets(
+        identity,
+        schema,
+        runtime,
+        gray_on_white,
+    )
+
+    assert [asset.asset_id for asset in black_assets] == [
+        asset.asset_id for asset in gray_assets
+    ]
+
+
+def test_provider_filters_to_three_visible_handwriting_fields(tmp_path: Path) -> None:
+    provider, generator = _provider(tmp_path)
+    result = provider.resolve_assets(_identity(), _schema())
+
+    assert isinstance(result, GeneratedHandwritingManifest)
+    assert set(result.asset_mappings) == ALLOWED_HANDWRITING_FIELDS
+    assert len(generator.calls) == 1
+    request = generator.calls[0]
+    assert [asset.field for asset in request.assets] == [
+        "patient_name",
+        "patient_id",
+        "accession_number",
+    ]
+
+
+def test_cache_miss_generates_and_cache_hit_skips_generator(tmp_path: Path) -> None:
+    provider, generator = _provider(tmp_path)
+    first_result = provider.resolve_assets(_identity(), _schema())
+
+    assert len(generator.calls) == 1
+    assert len(first_result.generated_asset_ids) == 3
+    assert first_result.cache_hit_asset_ids == []
+    assert (
+        first_result.manifest_path == tmp_path / "assets" / "seed-42" / "manifest.json"
+    )
+
+    payload = json.loads(first_result.manifest_path.read_text(encoding="utf-8"))
+    for asset in payload["assets"]:
+        assert not Path(asset["image_path"]).is_absolute()
+        assert not Path(asset["mask_path"]).is_absolute()
+        assert asset["cache_identity"]["seed"] == 42
+        assert asset["cache_identity"]["schema_id"] == "dicom-prototype"
+        assert asset["cache_identity"]["schema_version"] == "1.0.0"
+        assert asset["cache_identity"]["checkpoint_sha256"] == _checkpoint_sha()
+        assert asset["cache_identity"]["upstream_commit"] == "upstream-abc"
+        assert (
+            asset["cache_identity"]["generator_options"]["options_sha256"]
+            == _options_sha()
+        )
+
+    second_generator = FakeHandwritingGenerator()
+    second_provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(),
+        generator=second_generator,
+    )
+    second_result = second_provider.resolve_assets(_identity(), _schema())
+
+    assert second_generator.calls == []
+    assert second_result.generated_asset_ids == []
+    assert set(second_result.cache_hit_asset_ids) == set(
+        first_result.generated_asset_ids
+    )
+
+
+def test_cache_hit_rechecks_image_and_mask_hashes(tmp_path: Path) -> None:
+    provider, _generator = _provider(tmp_path)
+    first_result = provider.resolve_assets(_identity(), _schema())
+    payload = json.loads(first_result.manifest_path.read_text(encoding="utf-8"))
+    asset = payload["assets"][0]
+    image_path = first_result.manifest_path.parent / asset["image_path"]
+    image_path.write_bytes(b"changed image")
+
+    second_generator = FakeHandwritingGenerator()
+    second_provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(),
+        generator=second_generator,
+    )
+    second_result = second_provider.resolve_assets(_identity(), _schema())
+
+    assert len(second_generator.calls) == 1
+    assert asset["asset_id"] in second_result.generated_asset_ids
+    assert asset["asset_id"] not in second_result.cache_hit_asset_ids
+
+
+def test_provider_resolves_one_arbitrary_text_asset(tmp_path: Path) -> None:
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(alphabet="Patient is 95 years old"),
+        generator=generator,
+    )
+
+    result = provider.resolve_text_asset(
+        field="age",
+        text="Patient is 95 years old",
+        seed=99,
+        schema_id="api-injection",
+        schema_version="1.0.0",
+    )
+
+    assert len(generator.calls) == 1
+    assert len(generator.calls[0].assets) == 1
+    requested = generator.calls[0].assets[0]
+    assert requested.field == "age"
+    assert requested.text == "Patient is 95 years old"
+    assert requested.source_text == "Patient is 95 years old"
+    assert result.asset_mappings == {"age": requested.asset_id}
+    assert result.generated_asset_ids == [requested.asset_id]
+    assert result.manifest_path == tmp_path / "assets" / "seed-99" / "manifest.json"
+
+    payload = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    cached_asset = payload["assets"][0]
+    assert cached_asset["identity_field"] == "age"
+    assert cached_asset["source_text"] == "Patient is 95 years old"
+    assert cached_asset["cache_identity"]["schema_id"] == "api-injection"
+    assert cached_asset["cache_identity"]["field"] == "age"
+    assert (
+        cached_asset["cache_identity"]["generator_options"]["text_normalization"]
+        == "none"
+    )
+
+
+def test_provider_caches_arbitrary_text_asset_by_category_and_text(
+    tmp_path: Path,
+) -> None:
+    options = _options(alphabet="Patient is 95 years old")
+    first_generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=options,
+        generator=first_generator,
+    )
+    first_result = provider.resolve_text_asset(
+        field="age",
+        text="Patient is 95 years old",
+        seed=99,
+    )
+
+    second_generator = FakeHandwritingGenerator()
+    second_provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=options,
+        generator=second_generator,
+    )
+    second_result = second_provider.resolve_text_asset(
+        field="age",
+        text="Patient is 95 years old",
+        seed=99,
+    )
+
+    assert second_generator.calls == []
+    assert second_result.generated_asset_ids == []
+    assert second_result.cache_hit_asset_ids == first_result.generated_asset_ids
+
+
+def test_provider_preserves_arbitrary_text_whitespace(tmp_path: Path) -> None:
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(alphabet=" Patient is 95 years old "),
+        generator=generator,
+    )
+
+    provider.resolve_text_asset(
+        field="age",
+        text=" Patient is 95 years old ",
+        seed=99,
+    )
+
+    assert generator.calls[0].assets[0].text == " Patient is 95 years old "
+
+
+def test_provider_sanitizes_arbitrary_category_for_asset_id(tmp_path: Path) -> None:
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(alphabet="abc"),
+        generator=generator,
+    )
+
+    result = provider.resolve_text_asset(
+        field="custom/category:age",
+        text="abc",
+        seed=99,
+    )
+
+    asset_id = result.generated_asset_ids[0]
+    assert asset_id.startswith("custom_category_age-")
+    assert result.asset_mappings == {"custom/category:age": asset_id}
+
+
+def test_provider_rejects_arbitrary_text_outside_alphabet(tmp_path: Path) -> None:
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(alphabet="Patient is years old"),
+        generator=generator,
+    )
+
+    with pytest.raises(HandwritingAlphabetError, match="outside"):
+        provider.resolve_text_asset(
+            field="age",
+            text="Patient is 95 years old",
+            seed=99,
+        )
+
+    assert generator.calls == []
+
+
+def test_text_asset_request_preserves_text_but_trims_identifiers() -> None:
+    request = HandwritingTextAssetRequest(
+        seed=1,
+        field=" age ",
+        text=" Patient is 95 years old ",
+        schema_id=" api ",
+        schema_version=" 1 ",
+    )
+
+    assert request.field == "age"
+    assert request.text == " Patient is 95 years old "
+    assert request.schema_id == "api"
+    assert request.schema_version == "1"
+
+
+def test_provider_rejects_incompatible_alphabet_without_generator_call(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint.pth"
+    checkpoint_path.write_bytes(b"checkpoint")
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=HandwritingGeneratorOptions(
+            alphabet="ABC123-",
+            options_sha256=_options_sha(),
+        ),
+        generator=generator,
+    )
+
+    with pytest.raises(HandwritingAlphabetError, match="outside"):
+        provider.resolve_assets(_identity(), _schema())
+
+    assert generator.calls == []
+
+
+def test_provider_rejects_missing_checkpoint_before_generator_call(
+    tmp_path: Path,
+) -> None:
+    runtime = HandwritingRuntimeConfig(
+        checkpoint_path=tmp_path / "missing.pth",
+        checkpoint_sha256=_checkpoint_sha(),
+        upstream_commit="upstream-abc",
+        asset_root=tmp_path / "assets",
+    )
+    generator = FakeHandwritingGenerator()
+    provider = HandwritingAssetProvider(
+        runtime=runtime,
+        options=_options(),
+        generator=generator,
+    )
+
+    with pytest.raises(MissingHandwritingCheckpointError, match="not found"):
+        provider.resolve_assets(_identity(), _schema())
+
+    assert generator.calls == []
+
+
+def test_provider_propagates_generator_errors(tmp_path: Path) -> None:
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(),
+        generator=FailingHandwritingGenerator(),
+    )
+
+    with pytest.raises(HandwritingProviderError, match="generator exploded"):
+        provider.resolve_assets(_identity(), _schema())
+
+
+def test_docker_generator_mounts_workspace_and_translates_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    checkpoint_path = tmp_path / "checkpoint.pth"
+    checkpoint_path.write_bytes(b"checkpoint")
+    options_path = tmp_path / "test_opt.txt"
+    options_path.write_text("alphabet: ABC123-\n", encoding="utf-8")
+    input_manifest_path = tmp_path / "work" / "input.jsonl"
+    input_manifest_path.parent.mkdir()
+    input_manifest_path.write_text("{}\n", encoding="utf-8")
+    output_root = tmp_path / "work" / "generated"
+    request = HandwritingGenerationRequest(
+        input_manifest_path=input_manifest_path,
+        output_root=output_root,
+        run_id="run-001",
+        source_dir=source_dir,
+        options_sidecar_path=options_path,
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=_checkpoint_sha(),
+        upstream_commit="upstream-abc",
+        generator_command=None,
+        options=HandwritingGeneratorOptions(
+            alphabet="ABC123-",
+            options_sha256=_options_sha(),
+        ),
+        assets=[],
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[1:3] == ["image", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        manifest_path = output_root / "run-001" / "manifest.jsonl"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text("", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(provider_module.shutil, "which", lambda _: "docker")
+    monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+
+    result = DockerHandwritingGenerator(
+        image="injection-scrabblegan",
+        workspace_root=tmp_path,
+    ).generate(request)
+
+    assert result.manifest_path == output_root / "run-001" / "manifest.jsonl"
+    docker_run = calls[1]
+    platform_index = docker_run.index("--platform")
+    assert docker_run[platform_index + 1] == "linux/amd64"
+
+    mount_index = docker_run.index("--mount")
+    mount_argument = docker_run[mount_index + 1]
+    assert "type=bind,source=" in mount_argument
+    assert "target=/workspace" in mount_argument
+
+    def argument_value(option: str) -> str:
+        option_index = docker_run.index(option)
+        return docker_run[option_index + 1]
+
+    assert argument_value("--input") == "/workspace/work/input.jsonl"
+    assert argument_value("--source-dir") == "/workspace/source"
+    assert argument_value("--checkpoint") == "/workspace/checkpoint.pth"
+    assert argument_value("--options-json") == "/workspace/test_opt.txt"
+
+
+def test_provider_passes_options_sidecar_to_generator_request(tmp_path: Path) -> None:
+    provider, generator = _provider(tmp_path)
+    provider.resolve_assets(_identity(), _schema())
+
+    assert generator.calls[0].options_sidecar_path == tmp_path / "test_opt.txt"
+    assert generator.calls[0].options.options_sha256 == _options_sha()
+
+
+def test_provider_rejects_generated_manifest_with_wrong_options_hash(
+    tmp_path: Path,
+) -> None:
+    provider = HandwritingAssetProvider(
+        runtime=_runtime(tmp_path),
+        options=_options(),
+        generator=MismatchedOptionsGenerator(),
+    )
+
+    with pytest.raises(HandwritingProviderError, match="generator_options_sha256"):
+        provider.resolve_assets(_identity(), _schema())
+
+
+def _schema():
+    return load_identifier_schema(DEFAULT_IDENTIFIER_SCHEMA_PATH)
+
+
+def _identity() -> Identity:
+    return Identity(
+        identity_id="SYNTH-123456",
+        seed=42,
+        fields={
+            "patient_name": "Doe^Jane",
+            "patient_id": "SYNTH-123456",
+            "patient_birth_date": "19800101",
+            "patient_sex": "F",
+            "accession_number": "ACC-7654321",
+        },
+    )
+
+
+def _provider(
+    tmp_path: Path,
+) -> tuple[HandwritingAssetProvider, FakeHandwritingGenerator]:
+    generator = FakeHandwritingGenerator()
+    return (
+        HandwritingAssetProvider(
+            runtime=_runtime(tmp_path),
+            options=_options(),
+            generator=generator,
+        ),
+        generator,
+    )
+
+
+def _runtime(tmp_path: Path) -> HandwritingRuntimeConfig:
+    checkpoint_path = tmp_path / "checkpoint.pth"
+    checkpoint_path.write_bytes(b"checkpoint")
+    options_path = tmp_path / "test_opt.txt"
+    options_path.write_text("alphabet: Doe^JaneSYNTH-123456ACC-7654321\n")
+    return HandwritingRuntimeConfig(
+        checkpoint_path=checkpoint_path,
+        checkpoint_sha256=_checkpoint_sha(),
+        upstream_commit="upstream-abc",
+        asset_root=tmp_path / "assets",
+        options_sidecar_path=options_path,
+    )
+
+
+def _checkpoint_sha() -> str:
+    return hashlib.sha256(b"checkpoint").hexdigest()
+
+
+def _options_sha() -> str:
+    return hashlib.sha256(b"options").hexdigest()
+
+
+def _options(
+    alphabet: str = "Doe^JaneSYNTH-123456ACC-7654321",
+) -> HandwritingGeneratorOptions:
+    return HandwritingGeneratorOptions(
+        alphabet=alphabet,
+        options_sha256=_options_sha(),
+        extra={"options_sidecar_name": "test_opt.txt"},
+    )
+
+
+def _cache_identity(
+    *,
+    text: str,
+    schema_version: str = "1.0.0",
+    generator_options: dict[str, object] | None = None,
+) -> HandwritingCacheIdentity:
+    return HandwritingCacheIdentity(
+        seed=42,
+        schema_id="dicom-prototype",
+        schema_version=schema_version,
+        field="patient_name",
+        text=text,
+        checkpoint_sha256=_checkpoint_sha(),
+        upstream_commit="upstream-abc",
+        generator_options=generator_options or _options().model_dump(mode="json"),
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()

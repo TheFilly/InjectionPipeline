@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+dist/
+build/
+*.egg-info/
+
+Commands.md
+
+# Dicom data
+DicomData/
+
+# Test / coverage
+.pytest_cache/
+*pytest*/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tmp_pytest_hashes/
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# Local git worktrees
+.worktrees/
+
+# Local agent, QA, review and temporary work data
+/.cache-*/
+/.qa-*/
+/.review-*/
+/.test-*/
+/.tmp-*/
+/.uv-cache*/
+/.q/
+/.t/
+/.tb393fa8b/
+/qa-verification-final/
+
+# Thesis benchmark and evaluation results
+/thesis-results/
+
+# Legacy/local scratch directory; tracked legacy files remain tracked until
+# they are deliberately migrated or removed from the Git index.
+/tmp/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+*.orig
+
+# Test fixtures with real patient data
+tests/fixtures/*.dcm
+tests/fixtures/*.csv
+tests/fixtures/*.txt
+
+# Prototype outputs (modified DICOMs, ground truth)
+prototypes/dicom/output*/
+prototypes/dicom/output_review/
+prototypes/dicom/output_review_90/
+output/

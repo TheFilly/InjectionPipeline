@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "injection-pipeline"
+version = "0.1.0"
+description = "Scalable pipeline for injecting synthetic PII into anonymized medical documents"
+requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.0",
+    "pydicom>=2.4",
+    "faker>=25.0",
+    "matplotlib>=3.10.8",
+    "reportlab>=4.0",
+    "pypdf>=5.0",
+]
+
+[project.scripts]
+injection-pipeline = "injection_pipeline.runtime.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+markers = [
+    "local_data: tests requiring local files under DicomData/",
+]
+
+[tool.coverage.run]
+source = ["src/injection_pipeline"]
+
+[tool.ruff]
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+mypy_path = "src"
+files = ["src"]
