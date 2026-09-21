@@ -561,7 +561,8 @@ def _load_make_pdf_composition() -> _MakePdfComposition:
 # Input: Sequenzen aus Bild- und Textdaten, Quell-PDF, Ausgabeordner und Seed.
 #     Output: `PdfMakeArtifacts` mit PDF-Pfaden und Annotation-Sidecar.
 #     Die Funktion validiert die Public-API-Daten vorab, laedt das PDF-Template per
-#     Adapter und delegiert Layout, Rotation, Seitenumbrueche und Schreiben an den Writer.
+#     Adapter und delegiert Layout, Rotation, Seitenumbrueche und Schreiben an den
+#     Writer.
 #     
 def make_pdf(
     images: Sequence[PdfMakeImageInputLike],

@@ -59,7 +59,7 @@ def test_scalability_command_uses_python_and_no_shell_syntax() -> None:
         Path("input"), Path("out"), 10_000, 1_000, 4, 42
     )
 
-    assert command[0].endswith("python.exe") or command[0].endswith("python")
+    assert Path(command[0]).name.startswith("python")
     assert "--workers" in command and command[command.index("--workers") + 1] == "4"
     assert "--output-dir" in command
     assert all("&&" not in part and ";" not in part for part in command)
